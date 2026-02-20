@@ -2,7 +2,7 @@
 ## ASA South Florida 2026 Student Data Challenge
 ## Methods: LASSO, RF, VarGuid-RF, BART, VarGuid-BART
 ## No variable pre-screening — each method selects its own vars
-## 50-split CV + variable selection table + final prediction
+## 20-split CV + variable selection table + final prediction
 ## ============================================================
 
 # ---- 0. Load packages ----
