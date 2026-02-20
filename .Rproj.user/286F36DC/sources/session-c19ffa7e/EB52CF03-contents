@@ -1,0 +1,304 @@
+## ============================================================
+## ASA South Florida 2026 Student Data Challenge
+## Prediction Script: RF, BART, VarGuid-RF, VarGuid-BART
+## With 50-split train/validation comparison + final prediction
+## ============================================================
+
+# ---- 0. Load packages ----
+library(tidyverse)
+library(ggplot2)
+library(glmnet)    # for LASSO preprocessing / imputation fallback
+
+# Source the custom varguid ML functions
+source("irlsML1.2.R")
+
+# ---- 1. Download data ----
+tmp <- tempfile()
+download.file("https://luminwin.github.io/ASASF/train.rds", tmp, mode = "wb")
+train_raw <- readRDS(tmp)
+
+download.file("https://luminwin.github.io/ASASF/test.rds", tmp, mode = "wb")
+test_raw  <- readRDS(tmp)
+
+# ---- 2. Preprocessing ----
+# Outcome variable
+outcome_col <- "LBDHDD_outcome"
+
+# Separate outcome and predictors
+y_all <- as.numeric(train_raw[[outcome_col]])
+X_all <- train_raw[, !names(train_raw) %in% outcome_col, drop = FALSE]
+X_test_raw <- test_raw
+
+# Align test columns to train (drop outcome if accidentally present)
+X_test_raw <- X_test_raw[, intersect(names(X_all), names(X_test_raw)), drop = FALSE]
+
+# Combine for consistent preprocessing
+all_X <- rbind(X_all, X_test_raw)
+n_train_total <- nrow(X_all)
+
+# Convert all columns to numeric (factors -> integer codes)
+all_X_num <- as.data.frame(lapply(all_X, function(col) {
+  if (is.factor(col) || is.character(col)) as.numeric(as.factor(col))
+  else as.numeric(col)
+}))
+
+# Impute missing values with column median
+all_X_num <- as.data.frame(lapply(all_X_num, function(col) {
+  col[is.na(col)] <- median(col, na.rm = TRUE)
+  col
+}))
+
+# Split back
+X_all_clean  <- all_X_num[1:n_train_total, ]
+X_test_clean <- all_X_num[(n_train_total + 1):nrow(all_X_num), ]
+
+cat("Training features:", ncol(X_all_clean), "\n")
+cat("Training samples: ", nrow(X_all_clean), "\n")
+cat("Test samples:     ", nrow(X_test_clean), "\n")
+cat("Missing in train: ", sum(is.na(X_all_clean)), "\n")
+cat("Missing in test:  ", sum(is.na(X_test_clean)), "\n")
+
+# ---- 3. Optional: LASSO variable screening ----
+# Use LASSO to rank variables; keep top K for potentially faster fitting
+# (Comment out this block to use all predictors)
+set.seed(42)
+lasso_cv <- cv.glmnet(as.matrix(X_all_clean), y_all, alpha = 1, nfolds = 5)
+lasso_coefs <- coef(lasso_cv, s = "lambda.min")[-1, ]  # drop intercept
+selected_vars <- names(lasso_coefs[lasso_coefs != 0])
+cat("LASSO selected", length(selected_vars), "variables\n")
+
+# If LASSO selects very few, fall back to all variables
+if (length(selected_vars) < 10) {
+  selected_vars <- names(X_all_clean)
+  cat("Falling back to all variables\n")
+}
+
+X_all_final  <- X_all_clean[, selected_vars, drop = FALSE]
+X_test_final <- X_test_clean[, selected_vars, drop = FALSE]
+
+# Convert to matrix for varguid functions
+X_all_mat  <- as.matrix(X_all_final)
+X_test_mat <- as.matrix(X_test_final)
+
+# ---- 4. 50-split train/validation loop ----
+n_splits   <- 50
+val_frac   <- 0.2   # 20% validation = ~200 obs, 80% train = ~800 obs
+
+methods    <- c("rf_base", "rf_vg", "bart_base", "bart_vg")
+rmse_train <- matrix(NA, nrow = n_splits, ncol = length(methods),
+                     dimnames = list(NULL, methods))
+rmse_val   <- matrix(NA, nrow = n_splits, ncol = length(methods),
+                     dimnames = list(NULL, methods))
+
+set.seed(2026)
+seeds <- sample.int(1e6, n_splits)
+
+cat("\n--- Starting 50-split cross-validation ---\n")
+for (i in seq_len(n_splits)) {
+  set.seed(seeds[i])
+  val_idx <- sample(seq_len(nrow(X_all_mat)),
+                    size = floor(val_frac * nrow(X_all_mat)))
+  
+  Xtr <- X_all_mat[-val_idx, ]
+  ytr <- y_all[-val_idx]
+  Xte <- X_all_mat[val_idx, ]
+  yte <- y_all[val_idx]
+  
+  # ---- Random Forest ----
+  fit_rf <- tryCatch(
+    varguid_fit_ml(x = Xtr, y = ytr, method = "rfsrc",
+                   T = 10, tau = 1e-6, ntree = 500, nodesize = 5),
+    error = function(e) { message("RF error split ", i, ": ", e$message); NULL }
+  )
+  if (!is.null(fit_rf)) {
+    # Validation predictions
+    pred_rf_val   <- varguid_predict_ml(fit_rf, Xte)
+    rmse_val[i, "rf_base"] <- sqrt(mean((yte - pred_rf_val$baseline$mean)^2))
+    rmse_val[i, "rf_vg"]   <- sqrt(mean((yte - pred_rf_val$varguid$mean)^2))
+    # Train predictions (in-bag for baseline comparison)
+    pred_rf_tr    <- varguid_predict_ml(fit_rf, Xtr)
+    rmse_train[i, "rf_base"] <- sqrt(mean((ytr - pred_rf_tr$baseline$mean)^2))
+    rmse_train[i, "rf_vg"]   <- sqrt(mean((ytr - pred_rf_tr$varguid$mean)^2))
+  }
+  
+  # ---- BART ----
+  fit_bart <- tryCatch(
+    varguid_fit_ml(x = Xtr, y = ytr, method = "bart",
+                   T = 10, tau = 1e-6, ndpost = 800, nskip = 200),
+    error = function(e) { message("BART error split ", i, ": ", e$message); NULL }
+  )
+  if (!is.null(fit_bart)) {
+    pred_bart_val   <- varguid_predict_ml(fit_bart, Xte)
+    rmse_val[i, "bart_base"] <- sqrt(mean((yte - pred_bart_val$baseline$mean)^2))
+    rmse_val[i, "bart_vg"]   <- sqrt(mean((yte - pred_bart_val$varguid$mean)^2))
+    pred_bart_tr    <- varguid_predict_ml(fit_bart, Xtr)
+    rmse_train[i, "bart_base"] <- sqrt(mean((ytr - pred_bart_tr$baseline$mean)^2))
+    rmse_train[i, "bart_vg"]   <- sqrt(mean((ytr - pred_bart_tr$varguid$mean)^2))
+  }
+  
+  if (i %% 5 == 0) cat("  Completed split", i, "/", n_splits, "\n")
+}
+
+cat("--- Cross-validation complete ---\n\n")
+
+# ---- 5. Summary table ----
+rmse_train_df <- as.data.frame(rmse_train)
+rmse_val_df   <- as.data.frame(rmse_val)
+
+summary_table <- data.frame(
+  Method = methods,
+  Train_Mean = round(colMeans(rmse_train_df, na.rm = TRUE), 4),
+  Train_SD   = round(apply(rmse_train_df, 2, sd, na.rm = TRUE), 4),
+  Val_Mean   = round(colMeans(rmse_val_df, na.rm = TRUE), 4),
+  Val_SD     = round(apply(rmse_val_df, 2, sd, na.rm = TRUE), 4)
+)
+
+cat("========== RMSE Summary Table ==========\n")
+print(summary_table, row.names = FALSE)
+cat("\n")
+
+# Save table
+write.csv(summary_table, "rmse_summary_table.csv", row.names = FALSE)
+
+# ---- 6. Visualization ----
+# Reshape for plotting
+rmse_long <- bind_rows(
+  rmse_val_df   %>% mutate(split = 1:n_splits, set = "Validation"),
+  rmse_train_df %>% mutate(split = 1:n_splits, set = "Train")
+) %>%
+  pivot_longer(cols = all_of(methods), names_to = "Method", values_to = "RMSE") %>%
+  mutate(
+    Method = recode(Method,
+      rf_base   = "RF (Baseline)",
+      rf_vg     = "RF (VarGuid)",
+      bart_base = "BART (Baseline)",
+      bart_vg   = "BART (VarGuid)"
+    )
+  )
+
+# Plot 1: Boxplot of validation RMSE by method
+p1 <- rmse_long %>%
+  filter(set == "Validation") %>%
+  ggplot(aes(x = reorder(Method, RMSE, FUN = median), y = RMSE, fill = Method)) +
+  geom_boxplot(alpha = 0.7, outlier.shape = 21) +
+  geom_jitter(width = 0.1, alpha = 0.3, size = 1) +
+  coord_flip() +
+  labs(
+    title = "Validation RMSE Across 50 Random Splits",
+    subtitle = "Lower is better | Each point = one split",
+    x = NULL, y = "RMSE"
+  ) +
+  theme_bw(base_size = 13) +
+  theme(legend.position = "none")
+
+ggsave("plot1_validation_rmse_boxplot.png", p1, width = 8, height = 5, dpi = 150)
+
+# Plot 2: Train vs Validation RMSE (mean ± SD) — bias-variance view
+summary_plot <- summary_table %>%
+  pivot_longer(cols = c(Train_Mean, Val_Mean),
+               names_to = "Set", values_to = "Mean_RMSE") %>%
+  mutate(
+    SD = ifelse(Set == "Train_Mean", summary_table$Train_SD[match(Method, summary_table$Method)],
+                summary_table$Val_SD[match(Method, summary_table$Method)]),
+    Set = recode(Set, Train_Mean = "Train", Val_Mean = "Validation"),
+    Method = recode(Method,
+      rf_base   = "RF (Baseline)",
+      rf_vg     = "RF (VarGuid)",
+      bart_base = "BART (Baseline)",
+      bart_vg   = "BART (VarGuid)"
+    )
+  )
+
+p2 <- ggplot(summary_plot, aes(x = Method, y = Mean_RMSE, fill = Set)) +
+  geom_col(position = position_dodge(0.7), width = 0.6, alpha = 0.85) +
+  geom_errorbar(aes(ymin = Mean_RMSE - SD, ymax = Mean_RMSE + SD),
+                position = position_dodge(0.7), width = 0.25) +
+  labs(
+    title = "Train vs Validation RMSE by Method (Mean ± SD)",
+    subtitle = "50 random splits",
+    x = NULL, y = "RMSE", fill = "Dataset"
+  ) +
+  theme_bw(base_size = 13) +
+  theme(axis.text.x = element_text(angle = 15, hjust = 1))
+
+ggsave("plot2_train_val_rmse_comparison.png", p2, width = 8, height = 5, dpi = 150)
+
+# Plot 3: RMSE trajectory across splits
+p3 <- rmse_long %>%
+  filter(set == "Validation") %>%
+  group_by(split, Method) %>%
+  summarise(RMSE = mean(RMSE, na.rm = TRUE), .groups = "drop") %>%
+  ggplot(aes(x = split, y = RMSE, color = Method)) +
+  geom_line(alpha = 0.6) +
+  geom_smooth(se = FALSE, linewidth = 1.2) +
+  labs(
+    title = "Validation RMSE Across 50 Splits",
+    subtitle = "Smoothed trend line overlaid",
+    x = "Split Index", y = "RMSE", color = "Method"
+  ) +
+  theme_bw(base_size = 13)
+
+ggsave("plot3_rmse_trajectory.png", p3, width = 9, height = 5, dpi = 150)
+
+cat("Plots saved.\n\n")
+
+# ---- 7. Select best method ----
+best_idx    <- which.min(summary_table$Val_Mean)
+best_method <- summary_table$Method[best_idx]
+cat("========== Best method by mean validation RMSE: **", best_method, "** ==========\n\n")
+
+# ---- 8. Refit best method on ALL training data and predict test ----
+cat("Refitting best method on full training data...\n")
+
+if (best_method %in% c("rf_base", "rf_vg")) {
+  fit_final <- varguid_fit_ml(
+    x = X_all_mat, y = y_all,
+    method = "rfsrc",
+    T = 10, tau = 1e-6,
+    ntree = 500, nodesize = 5
+  )
+  pred_final <- varguid_predict_ml(fit_final, X_test_mat)
+  
+  if (best_method == "rf_vg") {
+    final_preds <- pred_final$varguid$mean
+  } else {
+    final_preds <- pred_final$baseline$mean
+  }
+  
+} else {
+  # bart_base or bart_vg
+  fit_final <- varguid_fit_ml(
+    x = X_all_mat, y = y_all,
+    method = "bart",
+    T = 10, tau = 1e-6,
+    ndpost = 800, nskip = 200
+  )
+  pred_final <- varguid_predict_ml(fit_final, X_test_mat)
+  
+  if (best_method == "bart_vg") {
+    final_preds <- pred_final$varguid$mean
+  } else {
+    final_preds <- pred_final$baseline$mean
+  }
+}
+
+cat("Final predictions summary:\n")
+print(summary(final_preds))
+
+# ---- 9. Save pred.csv ----
+pred_df <- data.frame(pred = final_preds)
+stopifnot(nrow(pred_df) == nrow(X_test_mat))   # safety check: must match test rows
+write.csv(pred_df, "pred.csv", row.names = FALSE)
+cat("\npred.csv saved with", nrow(pred_df), "rows.\n")
+cat("Column names:", names(pred_df), "\n")
+
+# ---- 10. Final summary ----
+cat("\n========== DONE ==========\n")
+cat("Files created:\n")
+cat("  pred.csv                        <- submission file\n")
+cat("  rmse_summary_table.csv          <- method comparison table\n")
+cat("  plot1_validation_rmse_boxplot.png\n")
+cat("  plot2_train_val_rmse_comparison.png\n")
+cat("  plot3_rmse_trajectory.png\n")
+cat("Best method used:", best_method, "\n")
+cat("Val RMSE (mean):", round(summary_table$Val_Mean[best_idx], 4), "\n")

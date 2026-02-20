@@ -1,0 +1,522 @@
+# ============================================================
+#  2026 ASA South Florida Student Data Challenge
+#  Model Comparison: RF, BART, DNN (Torch) via varguid
+#  Strategy: Repeated K-Fold Cross-Validation
+# ============================================================
+
+# ---- 0. Load Required Libraries ----
+library(tidyverse)
+library(caret)       # for createFolds
+library(ggplot2)
+library(knitr)
+
+# Source the varguid ML framework (must be in working directory)
+source("irlsML1.2.R")
+
+# ============================================================
+# ---- 1. Download & Prepare Data ----
+# ============================================================
+
+tmp <- tempfile()
+download.file("https://luminwin.github.io/ASASF/train.rds", tmp, mode = "wb")
+train <- readRDS(tmp)
+
+download.file("https://luminwin.github.io/ASASF/test.rds", tmp, mode = "wb")
+test  <- readRDS(tmp)
+
+# ---- 1.1 Separate outcome and predictors ----
+outcome_var <- "LBDHDD_outcome"
+
+y_full <- as.numeric(train[[outcome_var]])
+X_full <- train %>% select(-all_of(outcome_var))
+
+y_test <- NULL  # test labels not available
+X_test <- test
+
+# ---- 1.2 Preprocessing ----
+# Convert character/factor columns to numeric (one-hot or label encoding)
+preprocess_X <- function(df) {
+  # Convert factors/characters to numeric
+  df <- df %>%
+    mutate(across(where(is.character), ~ as.numeric(as.factor(.x)))) %>%
+    mutate(across(where(is.factor),    ~ as.numeric(.x)))
+  
+  # Convert to matrix, handle NAs with median imputation
+  df_mat <- as.matrix(df)
+  
+  for (j in seq_len(ncol(df_mat))) {
+    col_j <- df_mat[, j]
+    if (any(is.na(col_j))) {
+      df_mat[is.na(col_j), j] <- median(col_j, na.rm = TRUE)
+    }
+  }
+  return(df_mat)
+}
+
+X_full_mat <- preprocess_X(X_full)
+X_test_mat <- preprocess_X(X_test)
+
+cat("Training data dimensions:", dim(X_full_mat), "\n")
+cat("Test data dimensions:    ", dim(X_test_mat), "\n")
+cat("Outcome summary:\n")
+print(summary(y_full))
+
+# ============================================================
+# ---- 2. Repeated K-Fold Cross-Validation Setup ----
+# ============================================================
+
+set.seed(2026)
+n_repeats <- 3    # number of repetitions
+n_folds   <- 5    # number of folds per repetition
+
+# Storage for all CV results
+cv_results <- data.frame(
+  repeat_id  = integer(),
+  fold_id    = integer(),
+  method     = character(),
+  variant    = character(),   # "baseline" or "varguid"
+  rmse_train = numeric(),
+  rmse_val   = numeric(),
+  stringsAsFactors = FALSE
+)
+
+# ============================================================
+# ---- 3. Cross-Validation Loop ----
+# ============================================================
+
+cat("\n====== Starting Repeated Cross-Validation ======\n\n")
+
+for (r in seq_len(n_repeats)) {
+  
+  cat(sprintf(">>> Repeat %d / %d\n", r, n_repeats))
+  
+  # Create fold indices for this repetition
+  fold_indices <- createFolds(y_full, k = n_folds, list = TRUE, returnTrain = FALSE)
+  
+  for (f in seq_len(n_folds)) {
+    
+    cat(sprintf("  Fold %d / %d ...\n", f, n_folds))
+    
+    val_idx   <- fold_indices[[f]]
+    train_idx <- setdiff(seq_len(nrow(X_full_mat)), val_idx)
+    
+    Xtr <- X_full_mat[train_idx, ]
+    ytr <- y_full[train_idx]
+    Xval <- X_full_mat[val_idx, ]
+    yval <- y_full[val_idx]
+    
+    # ----------------------------------------------------------
+    # Method 1: Random Forest (rfsrc)
+    # ----------------------------------------------------------
+    cat("    Fitting RF ...\n")
+    tryCatch({
+      fit_rf <- varguid_fit_ml(
+        x        = Xtr,
+        y        = ytr,
+        method   = "rfsrc",
+        T        = 10,
+        tau      = 1e-6,
+        ntree    = 500,
+        nodesize = 5
+      )
+      
+      # Validation predictions
+      pred_rf_val   <- varguid_predict_ml(fit_rf, Xval)
+      # Train predictions (in-bag)
+      pred_rf_train <- varguid_predict_ml(fit_rf, Xtr)
+      
+      # Baseline RF
+      rmse_rf_val_base   <- sqrt(mean((yval - pred_rf_val$baseline$mean)^2))
+      rmse_rf_train_base <- sqrt(mean((ytr  - pred_rf_train$baseline$mean)^2))
+      
+      # Varguid RF
+      rmse_rf_val_vg   <- sqrt(mean((yval - pred_rf_val$varguid$mean)^2))
+      rmse_rf_train_vg <- sqrt(mean((ytr  - pred_rf_train$varguid$mean)^2))
+      
+      cv_results <- rbind(cv_results, data.frame(
+        repeat_id  = r, fold_id = f,
+        method     = "RF", variant = "baseline",
+        rmse_train = rmse_rf_train_base, rmse_val = rmse_rf_val_base
+      ))
+      cv_results <- rbind(cv_results, data.frame(
+        repeat_id  = r, fold_id = f,
+        method     = "RF", variant = "varguid",
+        rmse_train = rmse_rf_train_vg, rmse_val = rmse_rf_val_vg
+      ))
+      
+      cat(sprintf("    RF  | baseline val RMSE: %.4f | varguid val RMSE: %.4f\n",
+                  rmse_rf_val_base, rmse_rf_val_vg))
+      
+    }, error = function(e) {
+      cat(sprintf("    RF ERROR: %s\n", e$message))
+    })
+    
+    # ----------------------------------------------------------
+    # Method 2: BART
+    # ----------------------------------------------------------
+    cat("    Fitting BART ...\n")
+    tryCatch({
+      fit_bart <- varguid_fit_ml(
+        x      = Xtr,
+        y      = ytr,
+        method = "bart",
+        T      = 10,
+        tau    = 1e-6,
+        ndpost = 800,
+        nskip  = 200
+      )
+      
+      pred_bart_val   <- varguid_predict_ml(fit_bart, Xval)
+      pred_bart_train <- varguid_predict_ml(fit_bart, Xtr)
+      
+      rmse_bart_val_base   <- sqrt(mean((yval - pred_bart_val$baseline$mean)^2))
+      rmse_bart_train_base <- sqrt(mean((ytr  - pred_bart_train$baseline$mean)^2))
+      
+      rmse_bart_val_vg   <- sqrt(mean((yval - pred_bart_val$varguid$mean)^2))
+      rmse_bart_train_vg <- sqrt(mean((ytr  - pred_bart_train$varguid$mean)^2))
+      
+      cv_results <- rbind(cv_results, data.frame(
+        repeat_id  = r, fold_id = f,
+        method     = "BART", variant = "baseline",
+        rmse_train = rmse_bart_train_base, rmse_val = rmse_bart_val_base
+      ))
+      cv_results <- rbind(cv_results, data.frame(
+        repeat_id  = r, fold_id = f,
+        method     = "BART", variant = "varguid",
+        rmse_train = rmse_bart_train_vg, rmse_val = rmse_bart_val_vg
+      ))
+      
+      cat(sprintf("    BART| baseline val RMSE: %.4f | varguid val RMSE: %.4f\n",
+                  rmse_bart_val_base, rmse_bart_val_vg))
+      
+    }, error = function(e) {
+      cat(sprintf("    BART ERROR: %s\n", e$message))
+    })
+    
+    # ----------------------------------------------------------
+    # Method 3: DNN (Torch) — tune once per repeat, reuse spec
+    # ----------------------------------------------------------
+    cat("    Fitting DNN (Torch) ...\n")
+    tryCatch({
+      # Tune only on the first fold of each repeat to save time
+      if (f == 1) {
+        cat("    Tuning DNN hyperparameters (first fold of repeat) ...\n")
+        tuned_torch <- tune_varguid_dnn_torch(
+          Xtr, ytr,
+          k       = 5,
+          seed    = r * 100,
+          n_evals = 20        # reduce for speed; increase for better tuning
+        )
+        best_spec_r <- tuned_torch$best_spec
+        cat("    Best DNN spec found.\n")
+      }
+      
+      fit_dnn <- varguid_fit_ml(
+        x        = Xtr,
+        y        = ytr,
+        method   = "torch",
+        dnn_spec = best_spec_r,
+        T        = 10,
+        tau      = 1e-6
+      )
+      
+      pred_dnn_val   <- varguid_predict_ml(fit_dnn, Xval)
+      pred_dnn_train <- varguid_predict_ml(fit_dnn, Xtr)
+      
+      rmse_dnn_val_base   <- sqrt(mean((yval - pred_dnn_val$baseline$mean)^2))
+      rmse_dnn_train_base <- sqrt(mean((ytr  - pred_dnn_train$baseline$mean)^2))
+      
+      rmse_dnn_val_vg   <- sqrt(mean((yval - pred_dnn_val$varguid$mean)^2))
+      rmse_dnn_train_vg <- sqrt(mean((ytr  - pred_dnn_train$varguid$mean)^2))
+      
+      cv_results <- rbind(cv_results, data.frame(
+        repeat_id  = r, fold_id = f,
+        method     = "DNN", variant = "baseline",
+        rmse_train = rmse_dnn_train_base, rmse_val = rmse_dnn_val_base
+      ))
+      cv_results <- rbind(cv_results, data.frame(
+        repeat_id  = r, fold_id = f,
+        method     = "DNN", variant = "varguid",
+        rmse_train = rmse_dnn_train_vg, rmse_val = rmse_dnn_val_vg
+      ))
+      
+      cat(sprintf("    DNN | baseline val RMSE: %.4f | varguid val RMSE: %.4f\n",
+                  rmse_dnn_val_base, rmse_dnn_val_vg))
+      
+    }, error = function(e) {
+      cat(sprintf("    DNN ERROR: %s\n", e$message))
+    })
+    
+  }  # end fold loop
+}  # end repeat loop
+
+cat("\n====== Cross-Validation Complete ======\n\n")
+
+# Save raw CV results
+# write.csv(cv_results, "cv_results_raw.csv", row.names = FALSE)
+
+# ============================================================
+# ---- 4. Summarize CV Results ----
+# ============================================================
+
+# Create a combined method-variant label
+cv_results <- cv_results %>%
+  mutate(method_variant = paste0(method, "_", variant))
+
+# Summary table: mean and SD of RMSE across folds and repeats
+summary_table <- cv_results %>%
+  group_by(method, variant, method_variant) %>%
+  summarise(
+    mean_train_rmse = mean(rmse_train, na.rm = TRUE),
+    sd_train_rmse   = sd(rmse_train,   na.rm = TRUE),
+    mean_val_rmse   = mean(rmse_val,   na.rm = TRUE),
+    sd_val_rmse     = sd(rmse_val,     na.rm = TRUE),
+    n_folds_total   = n(),
+    .groups         = "drop"
+  ) %>%
+  arrange(mean_val_rmse)
+
+cat("======= Summary Table (sorted by mean validation RMSE) =======\n")
+print(summary_table, n = Inf)
+
+write.csv(summary_table, "cv_summary_table.csv", row.names = FALSE)
+
+# ============================================================
+# ---- 5. Visualizations ----
+# ============================================================
+
+# ---- 5.1 Boxplot: Validation RMSE by Method & Variant ----
+p1 <- ggplot(cv_results,
+             aes(x = reorder(method_variant, rmse_val, FUN = median),
+                 y = rmse_val,
+                 fill = variant)) +
+  geom_boxplot(alpha = 0.75, outlier.shape = 21, outlier.size = 2) +
+  geom_jitter(width = 0.15, alpha = 0.4, size = 1.5, color = "gray30") +
+  scale_fill_manual(values = c("baseline" = "#4E79A7", "varguid" = "#F28E2B"),
+                    name = "Variant") +
+  labs(
+    title    = "Repeated 5-Fold CV: Validation RMSE by Method",
+    subtitle = paste0(n_repeats, " repeats × ", n_folds, " folds"),
+    x        = "Method (Method_Variant)",
+    y        = "Validation RMSE"
+  ) +
+  theme_bw(base_size = 13) +
+  theme(
+    axis.text.x     = element_text(angle = 30, hjust = 1),
+    legend.position = "top",
+    plot.title      = element_text(face = "bold")
+  )
+
+print(p1)
+ggsave("plot1_val_rmse_boxplot.png", p1, width = 10, height = 6, dpi = 150)
+
+# ---- 5.2 Boxplot: Train vs. Validation RMSE (faceted) ----
+cv_long <- cv_results %>%
+  pivot_longer(cols = c(rmse_train, rmse_val),
+               names_to  = "split",
+               values_to = "rmse") %>%
+  mutate(split = recode(split,
+                        "rmse_train" = "Train",
+                        "rmse_val"   = "Validation"))
+
+p2 <- ggplot(cv_long,
+             aes(x = method_variant, y = rmse, fill = split)) +
+  geom_boxplot(alpha = 0.75, outlier.shape = 21) +
+  scale_fill_manual(values = c("Train" = "#59A14F", "Validation" = "#E15759"),
+                    name = "Data Split") +
+  facet_wrap(~ variant, scales = "free_y", ncol = 2) +
+  labs(
+    title    = "Train vs. Validation RMSE Across CV Folds",
+    subtitle = "Faceted by Variant (Baseline / Varguid)",
+    x        = "Method",
+    y        = "RMSE"
+  ) +
+  theme_bw(base_size = 13) +
+  theme(
+    axis.text.x     = element_text(angle = 30, hjust = 1),
+    legend.position = "top",
+    plot.title      = element_text(face = "bold")
+  )
+
+print(p2)
+ggsave("plot2_train_vs_val_rmse.png", p2, width = 12, height = 6, dpi = 150)
+
+# ---- 5.3 Mean ± SD Dot-Range Plot ----
+p3 <- ggplot(summary_table,
+             aes(x = reorder(method_variant, mean_val_rmse),
+                 y = mean_val_rmse,
+                 color = variant,
+                 shape = method)) +
+  geom_point(size = 4) +
+  geom_errorbar(aes(ymin = mean_val_rmse - sd_val_rmse,
+                    ymax = mean_val_rmse + sd_val_rmse),
+                width = 0.25, linewidth = 0.8) +
+  scale_color_manual(values = c("baseline" = "#4E79A7", "varguid" = "#F28E2B")) +
+  labs(
+    title    = "Mean ± SD of Validation RMSE (Repeated CV)",
+    subtitle = "Error bars represent ±1 SD across folds",
+    x        = "Method_Variant",
+    y        = "Mean Validation RMSE",
+    color    = "Variant",
+    shape    = "Method"
+  ) +
+  theme_bw(base_size = 13) +
+  theme(
+    axis.text.x  = element_text(angle = 30, hjust = 1),
+    plot.title   = element_text(face = "bold"),
+    legend.position = "top"
+  )
+
+print(p3)
+ggsave("plot3_mean_sd_val_rmse.png", p3, width = 9, height = 6, dpi = 150)
+
+# ---- 5.4 Heatmap of fold-level validation RMSE ----
+cv_results <- cv_results %>%
+  mutate(fold_label = paste0("R", repeat_id, "_F", fold_id))
+
+p4 <- ggplot(cv_results,
+             aes(x = fold_label, y = method_variant, fill = rmse_val)) +
+  geom_tile(color = "white", linewidth = 0.4) +
+  geom_text(aes(label = round(rmse_val, 2)), size = 2.8, color = "black") +
+  scale_fill_gradient(low = "#d4f1c4", high = "#d73027",
+                      name = "Val RMSE") +
+  labs(
+    title = "Heatmap: Validation RMSE per Fold",
+    x     = "Repeat_Fold",
+    y     = "Method_Variant"
+  ) +
+  theme_bw(base_size = 11) +
+  theme(
+    axis.text.x  = element_text(angle = 45, hjust = 1),
+    plot.title   = element_text(face = "bold")
+  )
+
+print(p4)
+ggsave("plot4_heatmap_rmse.png", p4, width = 14, height = 5, dpi = 150)
+
+# ============================================================
+# ---- 6. Select Best Method ----
+# ============================================================
+
+cat("\n======= MODEL SELECTION =======\n")
+
+# Best = lowest mean validation RMSE
+best_row <- summary_table %>% slice(1)
+
+cat(sprintf(
+  "Best method : %s\n  Method     : %s\n  Variant    : %s\n  Mean Val RMSE: %.4f (SD: %.4f)\n",
+  best_row$method_variant,
+  best_row$method,
+  best_row$variant,
+  best_row$mean_val_rmse,
+  best_row$sd_val_rmse
+))
+
+best_method  <- best_row$method    # "RF", "BART", or "DNN"
+best_variant <- best_row$variant   # "baseline" or "varguid"
+
+# ============================================================
+# ---- 7. Refit Best Model on FULL Training Data ----
+# ============================================================
+
+cat("\n======= Refitting Best Model on Full Training Data =======\n")
+
+Xtr_full <- X_full_mat
+ytr_full  <- y_full
+
+if (best_method == "RF") {
+  
+  cat("Refitting: Random Forest (rfsrc)\n")
+  fit_final <- varguid_fit_ml(
+    x        = Xtr_full,
+    y        = ytr_full,
+    method   = "rfsrc",
+    T        = 10,
+    tau      = 1e-6,
+    ntree    = 500,
+    nodesize = 5
+  )
+  
+} else if (best_method == "BART") {
+  
+  cat("Refitting: BART\n")
+  fit_final <- varguid_fit_ml(
+    x      = Xtr_full,
+    y      = ytr_full,
+    method = "bart",
+    T      = 10,
+    tau    = 1e-6,
+    ndpost = 800,
+    nskip  = 200
+  )
+  
+} else if (best_method == "DNN") {
+  
+  cat("Tuning DNN on full training data ...\n")
+  tuned_final <- tune_varguid_dnn_torch(
+    Xtr_full, ytr_full,
+    k       = 5,
+    seed    = 2026,
+    n_evals = 30
+  )
+  
+  cat("Refitting: DNN (Torch)\n")
+  fit_final <- varguid_fit_ml(
+    x        = Xtr_full,
+    y        = ytr_full,
+    method   = "torch",
+    dnn_spec = tuned_final$best_spec,
+    T        = 10,
+    tau      = 1e-6
+  )
+}
+
+# ============================================================
+# ---- 8. Generate Test Predictions & Save ----
+# ============================================================
+
+cat("\n======= Generating Test Set Predictions =======\n")
+
+pred_final <- varguid_predict_ml(fit_final, X_test_mat)
+
+# Select predictions from the best variant
+if (best_variant == "baseline") {
+  final_preds <- pred_final$baseline$mean
+} else {
+  final_preds <- pred_final$varguid$mean
+}
+
+cat(sprintf("Number of test predictions: %d\n", length(final_preds)))
+cat("Prediction summary:\n")
+print(summary(final_preds))
+
+# Save predictions
+pred_df <- data.frame(pred = final_preds)
+write.csv(pred_df, "pred.csv", row.names = FALSE)
+cat("\npred.csv saved successfully!\n")
+
+# ============================================================
+# ---- 9. Final Clean Summary Table Print ----
+# ============================================================
+
+cat("\n============================================================\n")
+cat("FINAL COMPARISON TABLE (Mean ± SD across Repeated CV Folds)\n")
+cat("============================================================\n")
+
+final_display <- summary_table %>%
+  select(method_variant, mean_train_rmse, sd_train_rmse,
+         mean_val_rmse, sd_val_rmse) %>%
+  mutate(
+    `Train RMSE (mean±sd)` = sprintf("%.4f ± %.4f", mean_train_rmse, sd_train_rmse),
+    `Val RMSE (mean±sd)`   = sprintf("%.4f ± %.4f", mean_val_rmse,   sd_val_rmse)
+  ) %>%
+  select(method_variant,
+         `Train RMSE (mean±sd)`,
+         `Val RMSE (mean±sd)`)
+
+print(final_display, n = Inf)
+
+cat("\n>>> SELECTED MODEL:", best_row$method_variant, "<<<\n")
+cat(">>> Predictions saved to pred.csv <<<\n")
+cat(">>> Plots saved as PNG files       <<<\n")
+cat(">>> Raw CV results in cv_results_raw.csv <<<\n")
